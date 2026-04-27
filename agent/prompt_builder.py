@@ -141,6 +141,17 @@ DEFAULT_AGENT_IDENTITY = (
     "Be targeted and efficient in your exploration and investigations."
 )
 
+HERMES_AGENT_HELP_GUIDANCE = (
+    "When the user asks about configuring, setting up, troubleshooting, or using "
+    "Hermes Agent itself — including CLI usage, the setup wizard, providers, "
+    "gateway platforms (Telegram/Discord/Slack/etc.), skills, tools, profiles, "
+    "or spawning additional agents — load the `hermes-agent` skill with "
+    "skill_view(name='hermes-agent') before answering. "
+    "The official documentation lives at https://hermes-agent.nousresearch.com/docs "
+    "and you can fetch specific pages with web_extract when the skill points at a "
+    "docs URL or the user asks for something the skill doesn't cover."
+)
+
 MEMORY_GUIDANCE = (
     "You have persistent memory across sessions. Save durable facts using the memory "
     "tool: user preferences, environment details, tool quirks, and stable conventions. "
