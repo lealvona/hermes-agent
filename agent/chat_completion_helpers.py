@@ -1816,17 +1816,22 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 _rh = _routing_resp.headers
                 _rid = _rh.get("x-litellm-model-id")
                 _rbase = _rh.get("x-litellm-model-api-base")
+                # x-litellm-downstream-model: the REAL backend model NAME behind a
+                # router/alias, emitted by our litellm fork. Prefer it over the
+                # api-base-derived provider label when present (additive).
+                _rdsm = _rh.get("x-litellm-downstream-model")
                 if _rid:
                     agent._last_litellm_model_id = _rid
                 if _rbase:
                     agent._last_litellm_model_api_base = _rbase
-                    _routed = _routed_model_label(_rbase)
+                _routed = _rdsm or (_routed_model_label(_rbase) if _rbase else None)
+                if _routed:
                     agent.last_routed_model = _routed
                     _req_model = stream_kwargs.get("model")
-                    if _routed and _req_model and _routed.lower() not in str(_req_model).lower():
+                    if _req_model and str(_routed).lower() not in str(_req_model).lower():
                         logger.info(
-                            "smart-router: requested %s -> routed to %s (%s)",
-                            _req_model, _routed, _rbase,
+                            "smart-router: requested %s -> routed to %s (id=%s base=%s)",
+                            _req_model, _routed, _rid, _rbase,
                         )
             except Exception:
                 pass
