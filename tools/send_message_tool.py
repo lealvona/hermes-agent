@@ -272,6 +272,11 @@ def _handle_send(args):
                 home = HomeChannel(platform=platform, chat_id=wx_home, name="Weixin Home")
         if home:
             chat_id = home.chat_id
+            # Split thread_id from chat_id if present (e.g. "-100123:5")
+            if not thread_id and platform_name == "telegram" and ":" in str(chat_id):
+                parts = str(chat_id).rsplit(":", 1)
+                chat_id = parts[0]
+                thread_id = parts[1]
             used_home_channel = True
         else:
             home_env = _HOME_CHANNEL_ENV_OVERRIDES.get(
