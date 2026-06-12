@@ -6257,38 +6257,82 @@ def dispatch_once(
             continue
         # ADDITIVE (lealvona): enforce kanban.board_assignee_policy. A task on
         # a restricted board whose assignee is not in the allowed set is
-        # STICKY-blocked (operator must reassign + unblock; recompute_ready
-        # will not auto-promote a sticky block). Enforced here — the single
-        # spawn chokepoint — so no assignment path (CLI, agent tool,
-        # default_assignee) can route a protected board's task to a
-        # disallowed profile.
+        # REROUTED to the policy's target profile (first allowed, sorted —
+        # deterministic) and spawns normally this tick: the work is shuttled
+        # to the allowed (e.g. local/airgapped) profile, never dropped.
+        # Enforced here — the single spawn chokepoint — so no assignment
+        # path (CLI, agent tool, default_assignee) can route a protected
+        # board's task to a disallowed profile. Sticky-block is kept only
+        # as the fallback when the target profile doesn't exist on this
+        # host (operator must intervene).
         if _board_policy_allowed is not None and row_assignee not in _board_policy_allowed:
-            try:
-                with write_txn(conn):
-                    conn.execute(
-                        "UPDATE tasks SET status = 'blocked', claim_lock = NULL "
-                        "WHERE id = ? AND status = 'ready'",
-                        (row["id"],),
+            _bp_target = sorted(_board_policy_allowed)[0]
+            _bp_target_ok = True
+            if profile_exists is not None:
+                try:
+                    _bp_target_ok = bool(profile_exists(_bp_target))
+                except Exception:
+                    _bp_target_ok = True
+            if _bp_target_ok:
+                try:
+                    with write_txn(conn):
+                        conn.execute(
+                            "UPDATE tasks SET assignee = ? "
+                            "WHERE id = ? AND status = 'ready'",
+                            (_bp_target, row["id"]),
+                        )
+                        _append_event(
+                            conn, row["id"], "assigned",
+                            {
+                                "assignee": _bp_target,
+                                "source": "kanban.board_assignee_policy",
+                                "rerouted_from": row_assignee,
+                                "reason": (
+                                    "board %r tasks may only run as one of %s; "
+                                    "rerouted %r -> %r"
+                                    % (_bp_board_slug, sorted(_board_policy_allowed),
+                                       row_assignee, _bp_target)
+                                ),
+                            },
+                        )
+                    row_assignee = _bp_target
+                    # fall through: spawns this tick under the allowed profile
+                except Exception:
+                    logger.warning(
+                        "kanban dispatch: failed to policy-reroute task %s",
+                        row["id"], exc_info=True,
                     )
-                    _append_event(
-                        conn, row["id"], "blocked",
-                        {
-                            "reason": (
-                                "board_assignee_policy: board %r tasks may only "
-                                "run as one of %s (got assignee %r). Reassign to "
-                                "an allowed profile, then unblock."
-                                % (_bp_board_slug, sorted(_board_policy_allowed), row_assignee)
-                            ),
-                            "source": "kanban.board_assignee_policy",
-                        },
+                    result.skipped_nonspawnable.append(row["id"])
+                    continue
+            else:
+                try:
+                    with write_txn(conn):
+                        conn.execute(
+                            "UPDATE tasks SET status = 'blocked', claim_lock = NULL "
+                            "WHERE id = ? AND status = 'ready'",
+                            (row["id"],),
+                        )
+                        _append_event(
+                            conn, row["id"], "blocked",
+                            {
+                                "reason": (
+                                    "board_assignee_policy: board %r tasks may only "
+                                    "run as one of %s (got assignee %r), and the "
+                                    "reroute target %r is not a profile on this "
+                                    "host. Reassign manually, then unblock."
+                                    % (_bp_board_slug, sorted(_board_policy_allowed),
+                                       row_assignee, _bp_target)
+                                ),
+                                "source": "kanban.board_assignee_policy",
+                            },
+                        )
+                except Exception:
+                    logger.warning(
+                        "kanban dispatch: failed to policy-block task %s",
+                        row["id"], exc_info=True,
                     )
-            except Exception:
-                logger.warning(
-                    "kanban dispatch: failed to policy-block task %s",
-                    row["id"], exc_info=True,
-                )
-            result.skipped_nonspawnable.append(row["id"])
-            continue
+                result.skipped_nonspawnable.append(row["id"])
+                continue
         # Per-profile concurrency cap (#21582): even if there's global
         # headroom, refuse to spawn for an assignee that's already at
         # its in-flight cap. Prevents one profile's local model / API
