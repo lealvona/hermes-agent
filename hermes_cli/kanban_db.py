@@ -6164,6 +6164,27 @@ def dispatch_once(
             # bucket it as nonspawnable if the profile genuinely isn't
             # there, with the existing diagnostic.
             _default_assignee_resolved = True
+    # ADDITIVE (lealvona): kanban.board_assignee_policy — resolve the allowed
+    # assignee profiles for this board from the DISPATCHING gateway's config
+    # (the dispatcher owns enforcement). Schema:
+    #   kanban:
+    #     board_assignee_policy:
+    #       private: [local-only]
+    # Boards absent from the mapping are unrestricted.
+    _board_policy_allowed = None
+    _bp_board_slug = board or "default"
+    try:
+        from hermes_cli.config import load_config as _bp_load_config
+        _bp_cfg = ((_bp_load_config().get("kanban") or {}).get("board_assignee_policy") or {})
+        if isinstance(_bp_cfg, dict):
+            _bp_list = _bp_cfg.get(_bp_board_slug)
+            if isinstance(_bp_list, (list, tuple)):
+                _bp_set = {str(x).strip() for x in _bp_list if str(x).strip()}
+                if _bp_set:
+                    _board_policy_allowed = _bp_set
+    except Exception:
+        _board_policy_allowed = None
+
     for row in ready_rows:
         if max_spawn is not None and running_count + spawned >= max_spawn:
             break
@@ -6232,6 +6253,40 @@ def dispatch_once(
             # this distinction to suppress spurious "stuck" warnings on
             # multi-lane setups where the ready queue is steadily full
             # of human-pulled work.
+            result.skipped_nonspawnable.append(row["id"])
+            continue
+        # ADDITIVE (lealvona): enforce kanban.board_assignee_policy. A task on
+        # a restricted board whose assignee is not in the allowed set is
+        # STICKY-blocked (operator must reassign + unblock; recompute_ready
+        # will not auto-promote a sticky block). Enforced here — the single
+        # spawn chokepoint — so no assignment path (CLI, agent tool,
+        # default_assignee) can route a protected board's task to a
+        # disallowed profile.
+        if _board_policy_allowed is not None and row_assignee not in _board_policy_allowed:
+            try:
+                with write_txn(conn):
+                    conn.execute(
+                        "UPDATE tasks SET status = 'blocked', claim_lock = NULL "
+                        "WHERE id = ? AND status = 'ready'",
+                        (row["id"],),
+                    )
+                    _append_event(
+                        conn, row["id"], "blocked",
+                        {
+                            "reason": (
+                                "board_assignee_policy: board %r tasks may only "
+                                "run as one of %s (got assignee %r). Reassign to "
+                                "an allowed profile, then unblock."
+                                % (_bp_board_slug, sorted(_board_policy_allowed), row_assignee)
+                            ),
+                            "source": "kanban.board_assignee_policy",
+                        },
+                    )
+            except Exception:
+                logger.warning(
+                    "kanban dispatch: failed to policy-block task %s",
+                    row["id"], exc_info=True,
+                )
             result.skipped_nonspawnable.append(row["id"])
             continue
         # Per-profile concurrency cap (#21582): even if there's global
