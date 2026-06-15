@@ -2898,3 +2898,137 @@ class TestSendTelegramThreadNotFoundRetry:
         finally:
             if media_path and os.path.exists(media_path):
                 os.unlink(media_path)
+
+
+
+# ---------------------------------------------------------------------------
+# Telegram home-channel thread_id split
+# ---------------------------------------------------------------------------
+
+class TestTelegramHomeChannelThreadIdSplit:
+    """When a Telegram home channel's chat_id contains a colon (e.g.
+    ``-1001234567890:5``), the ``_handle_send`` function must split it into
+    ``chat_id="-1001234567890"`` and ``thread_id="5"`` before dispatching to
+    ``_send_to_platform``.  This lets cron jobs and other auto-delivery paths
+    target a specific forum topic via ``TELEGRAM_HOME_CHANNEL``.
+    """
+
+    def _make_config_with_home(self, home_chat_id):
+        telegram_cfg = SimpleNamespace(enabled=True, token="***", extra={})
+        home = SimpleNamespace(chat_id=home_chat_id)
+        return SimpleNamespace(
+            platforms={Platform.TELEGRAM: telegram_cfg},
+            get_home_channel=lambda _platform: home,
+        ), telegram_cfg
+
+    def test_telegram_home_channel_splits_thread_id(self):
+        config, telegram_cfg = self._make_config_with_home("-1001234567890:17585")
+
+        with patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("gateway.mirror.mirror_to_session", return_value=True):
+            result = json.loads(
+                send_message_tool({
+                    "action": "send",
+                    "target": "telegram",
+                    "message": "hello topic",
+                })
+            )
+
+        assert result["success"] is True
+        send_mock.assert_awaited_once_with(
+            Platform.TELEGRAM,
+            telegram_cfg,
+            "-1001234567890",
+            "hello topic",
+            thread_id="17585",
+            media_files=[],
+            force_document=False,
+        )
+
+    def test_telegram_home_channel_no_colon_no_split(self):
+        config, telegram_cfg = self._make_config_with_home("-1001234567890")
+
+        with patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("gateway.mirror.mirror_to_session", return_value=True):
+            result = json.loads(
+                send_message_tool({
+                    "action": "send",
+                    "target": "telegram",
+                    "message": "hello plain",
+                })
+            )
+
+        assert result["success"] is True
+        send_mock.assert_awaited_once_with(
+            Platform.TELEGRAM,
+            telegram_cfg,
+            "-1001234567890",
+            "hello plain",
+            thread_id=None,
+            media_files=[],
+            force_document=False,
+        )
+
+    def test_explicit_target_with_thread_not_overridden_by_home_channel(self):
+        """When an explicit target with thread_id is given (e.g.
+        telegram:-1001234567890:42), the home channel is not consulted and
+        its embedded thread_id does not interfere."""
+        config, telegram_cfg = self._make_config_with_home("-1001234567890:99")
+
+        with patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("gateway.mirror.mirror_to_session", return_value=True):
+            result = json.loads(
+                send_message_tool({
+                    "action": "send",
+                    "target": "telegram:-1001234567890:42",
+                    "message": "hello explicit",
+                })
+            )
+
+        assert result["success"] is True
+        # thread_id="42" from the explicit target, not ":99" from home channel
+        send_mock.assert_awaited_once_with(
+            Platform.TELEGRAM,
+            telegram_cfg,
+            "-1001234567890",
+            "hello explicit",
+            thread_id="42",
+            media_files=[],
+            force_document=False,
+        )
+
+    def test_non_telegram_home_channel_not_split(self):
+        """Colon-split only applies to Telegram home channels."""
+        discord_cfg = SimpleNamespace(enabled=True, token="***", extra={})
+        home = SimpleNamespace(chat_id="123456:789")
+        config = SimpleNamespace(
+            platforms={Platform.DISCORD: discord_cfg},
+            get_home_channel=lambda _platform: home,
+        )
+
+        with patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("gateway.mirror.mirror_to_session", return_value=True):
+            result = json.loads(
+                send_message_tool({
+                    "action": "send",
+                    "target": "discord",
+                    "message": "hello discord",
+                })
+            )
+
+        assert result["success"] is True
+        # Discord keeps the full chat_id with colon intact
+        call_args = send_mock.await_args
+        assert call_args.args[2] == "123456:789"
