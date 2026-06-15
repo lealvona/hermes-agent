@@ -2162,6 +2162,20 @@ class APIServerAdapter(BasePlatformAdapter):
                 },
             }
             await response.write(f"data: {json.dumps(finish_chunk)}\n\n".encode())
+            # Smart-router routed-model: emit the backend the (smart-)router
+            # actually picked — captured streaming-safe by chat_completion_helpers
+            # (x-litellm-model-api-base/-model-id) — so frontends can show
+            # "asked smart-router -> ran kimi". Additive custom event; OpenAI
+            # clients ignore unknown event types.
+            try:
+                _routed_agent = agent_ref[0] if agent_ref else None
+                _routed_model = getattr(_routed_agent, "last_routed_model", None) if _routed_agent else None
+                if _routed_model:
+                    await response.write(
+                        f"event: hermes.routed.model\ndata: {json.dumps({'routed_model': _routed_model})}\n\n".encode()
+                    )
+            except Exception:
+                pass
             await response.write(b"data: [DONE]\n\n")
         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
             # Client disconnected mid-stream.  Interrupt the agent so it

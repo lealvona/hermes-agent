@@ -29,6 +29,16 @@ from typing import Any, Dict, List, Optional
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.display import KawaiiSpinner
+from agent.display_state_emitter import (
+    emit_thinking,
+    emit_working,
+    emit_typing,
+    emit_idle,
+    emit_error,
+    emit_success,
+    emit_waiting,
+    emit_from_response,
+)
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.iteration_budget import IterationBudget
 from agent.turn_context import build_turn_context
@@ -861,6 +871,7 @@ def run_conversation(
                 spinner_type = random.choice(['brain', 'sparkle', 'pulse', 'moon', 'star'])
                 thinking_spinner = KawaiiSpinner(f"{face} {verb}...", spinner_type=spinner_type, print_fn=agent._print_fn)
                 thinking_spinner.start()
+                emit_thinking()  # Display: thinking emoji
         
         # Log request details if verbose
         if agent.verbose_logging:
@@ -1215,6 +1226,7 @@ def run_conversation(
                     if thinking_spinner:
                         thinking_spinner.stop("")
                         thinking_spinner = None
+                    emit_error()  # Display: error emoji
                     if agent.thinking_callback:
                         agent.thinking_callback("")
                     
@@ -3486,6 +3498,15 @@ def run_conversation(
             normalized = _transport.normalize_response(response, **_normalize_kwargs)
             assistant_message = normalized
             finish_reason = normalized.finish_reason
+
+            # Emit display state based on response type
+            _tc = getattr(assistant_message, "tool_calls", None)
+            if _tc:
+                emit_working()  # Display: working emoji (tools to run)
+            elif assistant_message.content:
+                emit_typing()   # Display: typing emoji (text response)
+            else:
+                emit_idle()     # Display: idle emoji (empty response)
             
             # Normalize content to string — some OpenAI-compatible servers
             # (llama-server, etc.) return content as a dict or list instead
@@ -3904,6 +3925,7 @@ def run_conversation(
                     except Exception:
                         pass
 
+                emit_working()  # Display: working emoji (tools executing)
                 agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
 
                 if agent._tool_guardrail_halt_decision is not None:
@@ -4399,6 +4421,15 @@ def run_conversation(
     # Post-loop turn finalization extracted to agent/turn_finalizer.finalize_turn
     # (god-file decomposition Phase 1 step 4). Behavior-neutral: the assembled
     # result dict is returned exactly as before.
+    # Emit final display state (framebuffer overlay) before finalizing.
+    # Upstream extracted post-loop logic into turn_finalizer; the in-turn
+    # emits above remain. Use only in-scope vars (final_response, interrupted).
+    if interrupted:
+        emit_idle()     # Display: idle (interrupted)
+    elif final_response:
+        emit_success()  # Display: success
+    else:
+        emit_error()    # Display: error (no response)
     from agent.turn_finalizer import finalize_turn
     return finalize_turn(
         agent,

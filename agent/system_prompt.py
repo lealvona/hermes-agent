@@ -119,6 +119,15 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         tool_guidance.append(SESSION_SEARCH_GUIDANCE)
     if "skill_manage" in agent.valid_tool_names:
         tool_guidance.append(SKILLS_GUIDANCE)
+    if "set_display_state" in agent.valid_tool_names:
+        tool_guidance.append(
+            "After completing your response, call set_display_state to indicate "
+            "your current emotional/operational state. Choose: idle (waiting for user), "
+            "thinking (reasoning), typing (composing text), speaking (generating audio), "
+            "working (running tools), waiting (external input), happy (positive outcome), "
+            "success (task done), or error (something wrong). This controls the emoji "
+            "displayed on the physical screen."
+        )
     # Kanban worker/orchestrator lifecycle — only present when the
     # dispatcher spawned this process (kanban_show check_fn gates on
     # HERMES_KANBAN_TASK env var). Normal chat sessions never see
