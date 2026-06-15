@@ -394,6 +394,29 @@ def _auth_headers(api_key: str = "") -> Dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
 
 
+def _resolve_probe_api_key(base_url: str) -> str:
+    """Best-effort fallback credential for endpoint discovery probes.
+
+    Several call paths (CLI startup, cron wrappers, insights costing) reach
+    ``fetch_endpoint_model_metadata()`` / ``detect_local_server_type()``
+    without an api_key. Probing an auth-enforcing endpoint (e.g. a LiteLLM
+    proxy) bare then 401s on every attempt and floods the server's log with
+    'No api key passed in' errors — and the caller never gets metadata.
+    When the probed base_url matches the active profile's main runtime
+    endpoint, reuse that runtime's key. Best-effort; never raises.
+    """
+    try:
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+
+        rt = resolve_runtime_provider()
+        key = str(rt.get("api_key") or "").strip()
+        if key and _normalize_base_url(str(rt.get("base_url") or "")) == _normalize_base_url(base_url):
+            return key
+    except Exception:
+        pass
+    return ""
+
+
 def _is_openrouter_base_url(base_url: str) -> bool:
     return base_url_host_matches(base_url, "openrouter.ai")
 
@@ -545,6 +568,10 @@ def detect_local_server_type(base_url: str, api_key: str = "") -> Optional[str]:
     if server_url.endswith("/v1"):
         server_url = server_url[:-3]
 
+    # Keyless callers: probe with the active runtime's credential when the
+    # target is the configured endpoint (avoids 401 log-spam on the server).
+    if not api_key:
+        api_key = _resolve_probe_api_key(normalized)
     headers = _auth_headers(api_key)
 
     try:
@@ -763,6 +790,11 @@ def fetch_endpoint_model_metadata(
     if alternate and alternate not in candidates:
         candidates.append(alternate)
 
+    # Keyless callers: fall back to the active runtime's credential when the
+    # target is the configured endpoint (avoids 401 log-spam on the server
+    # and lets the metadata fetch actually succeed).
+    if not api_key:
+        api_key = _resolve_probe_api_key(normalized)
     headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
     last_error: Optional[Exception] = None
 

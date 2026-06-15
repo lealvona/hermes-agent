@@ -6164,6 +6164,27 @@ def dispatch_once(
             # bucket it as nonspawnable if the profile genuinely isn't
             # there, with the existing diagnostic.
             _default_assignee_resolved = True
+    # ADDITIVE (lealvona): kanban.board_assignee_policy — resolve the allowed
+    # assignee profiles for this board from the DISPATCHING gateway's config
+    # (the dispatcher owns enforcement). Schema:
+    #   kanban:
+    #     board_assignee_policy:
+    #       private: [local-only]
+    # Boards absent from the mapping are unrestricted.
+    _board_policy_allowed = None
+    _bp_board_slug = board or "default"
+    try:
+        from hermes_cli.config import load_config as _bp_load_config
+        _bp_cfg = ((_bp_load_config().get("kanban") or {}).get("board_assignee_policy") or {})
+        if isinstance(_bp_cfg, dict):
+            _bp_list = _bp_cfg.get(_bp_board_slug)
+            if isinstance(_bp_list, (list, tuple)):
+                _bp_set = {str(x).strip() for x in _bp_list if str(x).strip()}
+                if _bp_set:
+                    _board_policy_allowed = _bp_set
+    except Exception:
+        _board_policy_allowed = None
+
     for row in ready_rows:
         if max_spawn is not None and running_count + spawned >= max_spawn:
             break
@@ -6234,6 +6255,84 @@ def dispatch_once(
             # of human-pulled work.
             result.skipped_nonspawnable.append(row["id"])
             continue
+        # ADDITIVE (lealvona): enforce kanban.board_assignee_policy. A task on
+        # a restricted board whose assignee is not in the allowed set is
+        # REROUTED to the policy's target profile (first allowed, sorted —
+        # deterministic) and spawns normally this tick: the work is shuttled
+        # to the allowed (e.g. local/airgapped) profile, never dropped.
+        # Enforced here — the single spawn chokepoint — so no assignment
+        # path (CLI, agent tool, default_assignee) can route a protected
+        # board's task to a disallowed profile. Sticky-block is kept only
+        # as the fallback when the target profile doesn't exist on this
+        # host (operator must intervene).
+        if _board_policy_allowed is not None and row_assignee not in _board_policy_allowed:
+            _bp_target = sorted(_board_policy_allowed)[0]
+            _bp_target_ok = True
+            if profile_exists is not None:
+                try:
+                    _bp_target_ok = bool(profile_exists(_bp_target))
+                except Exception:
+                    _bp_target_ok = True
+            if _bp_target_ok:
+                try:
+                    with write_txn(conn):
+                        conn.execute(
+                            "UPDATE tasks SET assignee = ? "
+                            "WHERE id = ? AND status = 'ready'",
+                            (_bp_target, row["id"]),
+                        )
+                        _append_event(
+                            conn, row["id"], "assigned",
+                            {
+                                "assignee": _bp_target,
+                                "source": "kanban.board_assignee_policy",
+                                "rerouted_from": row_assignee,
+                                "reason": (
+                                    "board %r tasks may only run as one of %s; "
+                                    "rerouted %r -> %r"
+                                    % (_bp_board_slug, sorted(_board_policy_allowed),
+                                       row_assignee, _bp_target)
+                                ),
+                            },
+                        )
+                    row_assignee = _bp_target
+                    # fall through: spawns this tick under the allowed profile
+                except Exception:
+                    logger.warning(
+                        "kanban dispatch: failed to policy-reroute task %s",
+                        row["id"], exc_info=True,
+                    )
+                    result.skipped_nonspawnable.append(row["id"])
+                    continue
+            else:
+                try:
+                    with write_txn(conn):
+                        conn.execute(
+                            "UPDATE tasks SET status = 'blocked', claim_lock = NULL "
+                            "WHERE id = ? AND status = 'ready'",
+                            (row["id"],),
+                        )
+                        _append_event(
+                            conn, row["id"], "blocked",
+                            {
+                                "reason": (
+                                    "board_assignee_policy: board %r tasks may only "
+                                    "run as one of %s (got assignee %r), and the "
+                                    "reroute target %r is not a profile on this "
+                                    "host. Reassign manually, then unblock."
+                                    % (_bp_board_slug, sorted(_board_policy_allowed),
+                                       row_assignee, _bp_target)
+                                ),
+                                "source": "kanban.board_assignee_policy",
+                            },
+                        )
+                except Exception:
+                    logger.warning(
+                        "kanban dispatch: failed to policy-block task %s",
+                        row["id"], exc_info=True,
+                    )
+                result.skipped_nonspawnable.append(row["id"])
+                continue
         # Per-profile concurrency cap (#21582): even if there's global
         # headroom, refuse to spawn for an assignee that's already at
         # its in-flight cap. Prevents one profile's local model / API
@@ -6638,7 +6737,18 @@ def _kanban_worker_skill_available(hermes_home: Optional[str]) -> bool:
         return True
     try:
         for skill_md in skills_root.rglob("kanban-worker/SKILL.md"):
-            if skill_md.is_file():
+            # LOCAL PATCH (lealvona fleet, 2026-06-09): ignore archived/hidden
+            # dirs (e.g. .archive/). rglob descends into them but the runtime
+            # skill LOADER never loads from dotdirs — so a kanban-worker that
+            # exists only under .archive/ made this gate add `--skills
+            # kanban-worker` and the worker then crashed `Unknown skill(s):
+            # kanban-worker`. Excluding dotdir components makes the gate agree
+            # with the loader: archived-only => not available => flag omitted
+            # (kanban lifecycle still ships via KANBAN_GUIDANCE). Re-apply after
+            # hermes update: ~/.hermes/local-patches/apply-kanban-db-patches.py
+            if skill_md.is_file() and not any(
+                part.startswith(".") for part in skill_md.relative_to(skills_root).parts
+            ):
                 return True
     except OSError:
         pass
@@ -6708,6 +6818,41 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
         )
         return None
 
+# --- LOCAL PATCH (lealvona fleet, 2026-06-09): kanban worker env scrub -------
+# Workers self-load their own profile's .env at CLI startup (load_hermes_dotenv,
+# override semantics), so any credential a worker legitimately needs comes back
+# from its own profile. Scrubbing credential-looking vars from the inherited
+# dispatcher env stops cross-profile secret leakage — e.g. cloud API keys
+# reaching the air-gapped local-only profile's Category B (PII) workers.
+# Escape hatch: HERMES_KANBAN_SCRUB_WORKER_ENV=0 disables the scrub.
+# Re-apply after `hermes update`: ~/.hermes/local-patches/apply-kanban-env-scrub.py
+_WORKER_ENV_SCRUB_SUFFIXES = (
+    "_API_KEY", "_TOKEN", "_SECRET", "_KEY", "_PASSWORD", "_PASSPHRASE",
+    "_CREDENTIALS", "_AUTH",
+)
+
+
+def _scrubbed_parent_env() -> dict:
+    """Copy of ``os.environ`` minus credential-looking variables (LOCAL PATCH)."""
+    if os.environ.get("HERMES_KANBAN_SCRUB_WORKER_ENV", "").strip().lower() in (
+        "0", "false", "no", "off"
+    ):
+        return dict(os.environ)
+    out = {}
+    scrubbed = 0
+    for k, v in os.environ.items():
+        if k.upper().endswith(_WORKER_ENV_SCRUB_SUFFIXES):
+            scrubbed += 1
+            continue
+        out[k] = v
+    if scrubbed:
+        _log.info(
+            "kanban spawn env-scrub (local patch): removed %d credential-like "
+            "vars from inherited worker env", scrubbed,
+        )
+    return out
+# --- END LOCAL PATCH ---------------------------------------------------------
+
 
 def _default_spawn(
     task: Task,
@@ -6736,7 +6881,8 @@ def _default_spawn(
     profile_arg = normalize_profile_name(task.assignee)
 
     prompt = f"work kanban task {task.id}"
-    env = dict(os.environ)
+    # LOCAL PATCH: scrub inherited credentials; workers self-load their own .env.
+    env = _scrubbed_parent_env()
 
     # Inject HERMES_HOME so the worker reads the profile-scoped config.yaml
     # (fallback_providers, toolsets, agent settings, etc.) instead of the root
