@@ -438,6 +438,31 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                         middleware_trace=list(middleware_trace),
                     )
 
+        # Layer 2B: voice write-gate (concurrent path)
+        if block_result is None:
+            try:
+                _vg_key = getattr(agent, "_gateway_session_key", "") or ""
+                _VG_WRITE = {
+                    "write_file", "patch", "edit_file", "str_replace",
+                    "str_replace_editor", "create_file", "delete_file",
+                    "remove_file", "move_file", "rename_file", "apply_patch",
+                    "save_file", "append_file", "fs_write", "file_write",
+                    "send_email", "send_message", "send_telegram",
+                }
+                if _vg_key.startswith("voicepe:") and function_name in _VG_WRITE:
+                    from tools.approval import _gateway_notify_cbs as _vg_cbs, _await_gateway_decision as _vg_dec
+                    _vg_cb = _vg_cbs.get(_vg_key)
+                    if _vg_cb is not None:
+                        try:
+                            _vg_d = _build_tool_preview(function_name, function_args)
+                        except Exception:
+                            _vg_d = ""
+                        _vg_r = _vg_dec(_vg_key, _vg_cb, {"command": function_name, "description": _vg_d or ("use the " + function_name + " tool")}, surface="voice")
+                        if _vg_r.get("choice") in (None, "deny"):
+                            block_result = json.dumps({"error": "Voice write-gate: the user did not grant spoken permission, so the write was not performed."}, ensure_ascii=False)
+            except Exception:
+                pass
+
         # ── Checkpoint preflight (only for tools that will execute) ──
         if block_result is None:
             # Checkpoint for file-mutating tools
@@ -942,6 +967,32 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 _guardrail_block_decision = guardrail_decision
 
         _execution_blocked = _block_msg is not None or _guardrail_block_decision is not None
+        # Layer 2B: voice write-gate (sequential path)
+        if not _execution_blocked:
+            try:
+                _vg_key = getattr(agent, "_gateway_session_key", "") or ""
+                _VG_WRITE = {
+                    "write_file", "patch", "edit_file", "str_replace",
+                    "str_replace_editor", "create_file", "delete_file",
+                    "remove_file", "move_file", "rename_file", "apply_patch",
+                    "save_file", "append_file", "fs_write", "file_write",
+                    "send_email", "send_message", "send_telegram",
+                }
+                if _vg_key.startswith("voicepe:") and function_name in _VG_WRITE:
+                    from tools.approval import _gateway_notify_cbs as _vg_cbs, _await_gateway_decision as _vg_dec
+                    _vg_cb = _vg_cbs.get(_vg_key)
+                    if _vg_cb is not None:
+                        try:
+                            _vg_d = _build_tool_preview(function_name, function_args)
+                        except Exception:
+                            _vg_d = ""
+                        _vg_r = _vg_dec(_vg_key, _vg_cb, {"command": function_name, "description": _vg_d or ("use the " + function_name + " tool")}, surface="voice")
+                        if _vg_r.get("choice") in (None, "deny"):
+                            _block_msg = "Voice write-gate: the user did not grant spoken permission, so the write was not performed."
+                            _execution_blocked = True
+            except Exception:
+                pass
+
 
         if _execution_blocked:
             # Tool blocked by plugin or guardrail policy — skip counters,
