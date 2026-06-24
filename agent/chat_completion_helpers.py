@@ -39,6 +39,33 @@ from utils import base_url_host_matches, base_url_hostname, env_float, env_int
 logger = logging.getLogger(__name__)
 
 
+def _routed_model_label(api_base: str) -> str:
+    """Human label for the backend a LiteLLM (smart-)router actually used.
+
+    Derived from the ``x-litellm-model-api-base`` response header, which —
+    unlike ``x-litellm-model-group`` — survives the streaming response path.
+    """
+    b = (api_base or "").lower()
+    for needle, label in (
+        ("kimi", "kimi"),
+        ("minimax", "minimax"),
+        ("z.ai", "glm"),
+        ("bigmodel", "glm"),
+        ("zhipu", "glm"),
+        ("anthropic", "claude"),
+        ("generativelanguage", "gemini"),
+        ("openai", "gpt"),
+    ):
+        if needle in b:
+            return label
+    try:
+        from urllib.parse import urlparse
+
+        return urlparse(api_base).netloc or (api_base or "")
+    except Exception:
+        return api_base or ""
+
+
 def _ra():
     """Lazy ``run_agent`` reference.
 
@@ -1875,6 +1902,37 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
 
         # Log OpenRouter response cache status when present.
         agent._check_openrouter_cache_status(getattr(stream, "response", None))
+
+        # --- Smart-router routed-model capture (STREAMING-SAFE) ---
+        # The LiteLLM adaptive/smart router restamps the response, but on the
+        # streaming path it DROPS x-litellm-model-group. The model-id and
+        # api-base headers persist, so capture those and derive the backend
+        # the router actually picked. Best-effort; never raises.
+        _routing_resp = getattr(stream, "response", None)
+        if _routing_resp is not None:
+            try:
+                _rh = _routing_resp.headers
+                _rid = _rh.get("x-litellm-model-id")
+                _rbase = _rh.get("x-litellm-model-api-base")
+                # x-litellm-downstream-model: the REAL backend model NAME behind a
+                # router/alias, emitted by our litellm fork. Prefer it over the
+                # api-base-derived provider label when present (additive).
+                _rdsm = _rh.get("x-litellm-downstream-model")
+                if _rid:
+                    agent._last_litellm_model_id = _rid
+                if _rbase:
+                    agent._last_litellm_model_api_base = _rbase
+                _routed = _rdsm or (_routed_model_label(_rbase) if _rbase else None)
+                if _routed:
+                    agent.last_routed_model = _routed
+                    _req_model = stream_kwargs.get("model")
+                    if _req_model and str(_routed).lower() not in str(_req_model).lower():
+                        logger.info(
+                            "smart-router: requested %s -> routed to %s (id=%s base=%s)",
+                            _req_model, _routed, _rid, _rbase,
+                        )
+            except Exception:
+                pass
 
         content_parts: list = []
         tool_calls_acc: dict = {}

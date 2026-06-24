@@ -246,6 +246,19 @@ def main(argv: list[str] | None = None) -> None:
     import acp
     from .server import HermesACPAgent
 
+    # Register shell hooks (config.yaml `hooks:` block) for this process.
+    # The CLI (hermes_cli/main.py) and gateway (gateway/run.py) both do
+    # this at startup; ACP sessions run AIAgent in-process too, so policy
+    # hooks (e.g. pre_tool_call guards) must be registered here as well
+    # or ACP-driven tool calls bypass them. Best-effort — a hook problem
+    # must never block the adapter.
+    try:
+        from agent.shell_hooks import register_from_config
+        from hermes_cli.config import load_config as _hooks_load_config
+        register_from_config(_hooks_load_config(), accept_hooks=False)
+    except Exception:
+        logger.warning("shell-hook registration failed", exc_info=True)
+
     # MCP tool discovery from config.yaml — run before asyncio.run() so
     # it's safe to use blocking waits.  (ACP also registers per-session
     # MCP servers dynamically via asyncio.to_thread inside the event

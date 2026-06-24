@@ -1060,6 +1060,26 @@ class APIServerAdapter(BasePlatformAdapter):
     # Agent creation helper
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _extract_reasoning_effort(body: Dict[str, Any]) -> Optional[str]:
+        """Pull the OWUI reasoning toggle out of a chat/responses request body.
+
+        Accepts both the chat-completions shape (top-level ``reasoning_effort``)
+        and the Responses shape (``reasoning: {effort: ...}``). Returns the raw
+        string (none/off/minimal/low/medium/high/xhigh/…) or None — the .115
+        litellm proxy normalizes + translates it to each routed model's native
+        thinking param (thinking_control.py / auto_router H3 injection).
+        """
+        v = body.get("reasoning_effort")
+        if not v:
+            r = body.get("reasoning")
+            if isinstance(r, dict):
+                v = r.get("effort")
+        if v is None:
+            return None
+        v = str(v).strip()
+        return v or None
+
     def _create_agent(
         self,
         ephemeral_system_prompt: Optional[str] = None,
@@ -1068,7 +1088,9 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_progress_callback=None,
         tool_start_callback=None,
         tool_complete_callback=None,
+        reasoning_callback=None,
         gateway_session_key: Optional[str] = None,
+        reasoning_effort: Optional[str] = None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -1122,11 +1144,22 @@ class APIServerAdapter(BasePlatformAdapter):
             tool_progress_callback=tool_progress_callback,
             tool_start_callback=tool_start_callback,
             tool_complete_callback=tool_complete_callback,
+            reasoning_callback=reasoning_callback,
             session_db=self._ensure_session_db(),
             fallback_model=fallback_model,
             reasoning_config=reasoning_config,
             gateway_session_key=gateway_session_key,
         )
+        # OWUI reasoning toggle (H2, 2026-06-23): forward the per-request
+        # reasoning_effort to the MAIN model via request_overrides → emitted as
+        # top-level reasoning_effort on the smart-router call; the .115 proxy
+        # auto_router (H3) then translates it to the routed model's native
+        # thinking param. Aux calls (compression/title) go through
+        # auxiliary_client, which ignores request_overrides → unaffected.
+        if reasoning_effort:
+            _ro = dict(getattr(agent, "request_overrides", None) or {})
+            _ro["reasoning_effort"] = reasoning_effort
+            agent.request_overrides = _ro
         return agent
 
     # ------------------------------------------------------------------
@@ -1829,6 +1862,7 @@ class APIServerAdapter(BasePlatformAdapter):
             )
 
         stream = _coerce_request_bool(body.get("stream"), default=False)
+        reasoning_effort_override = self._extract_reasoning_effort(body)
 
         # Extract system message (becomes ephemeral system prompt layered ON TOP of core)
         system_prompt = None
@@ -2009,6 +2043,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_complete_callback=_on_tool_complete,
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
+                reasoning_effort=reasoning_effort_override,
             ))
             # Ensure SSE drain loops can terminate without relying on polling
             # agent_task.done(), which can race with queue timeout checks.
@@ -2028,6 +2063,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 ephemeral_system_prompt=system_prompt,
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
+                reasoning_effort=reasoning_effort_override,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -2245,6 +2281,20 @@ class APIServerAdapter(BasePlatformAdapter):
                 },
             }
             await response.write(f"data: {json.dumps(finish_chunk)}\n\n".encode())
+            # Smart-router routed-model: emit the backend the (smart-)router
+            # actually picked — captured streaming-safe by chat_completion_helpers
+            # (x-litellm-model-api-base/-model-id) — so frontends can show
+            # "asked smart-router -> ran kimi". Additive custom event; OpenAI
+            # clients ignore unknown event types.
+            try:
+                _routed_agent = agent_ref[0] if agent_ref else None
+                _routed_model = getattr(_routed_agent, "last_routed_model", None) if _routed_agent else None
+                if _routed_model:
+                    await response.write(
+                        f"event: hermes.routed.model\ndata: {json.dumps({'routed_model': _routed_model})}\n\n".encode()
+                    )
+            except Exception:
+                pass
             await response.write(b"data: [DONE]\n\n")
         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
             # Client disconnected mid-stream.  Interrupt the agent so it
@@ -2367,6 +2417,12 @@ class APIServerAdapter(BasePlatformAdapter):
         message_item_id = f"msg_{uuid.uuid4().hex[:24]}"
         message_output_index: Optional[int] = None
         message_opened = False
+        # Single reasoning output item (model chain-of-thought), opened
+        # lazily on the first reasoning_callback delta.  See _emit_reasoning.
+        reasoning_item_id = f"rs_{uuid.uuid4().hex[:24]}"
+        reasoning_output_index: Optional[int] = None
+        reasoning_opened = False
+        reasoning_item: Optional[Dict[str, Any]] = None
 
         async def _write_event(event_type: str, data: Dict[str, Any]) -> None:
             nonlocal sequence_number
@@ -2489,6 +2545,47 @@ class APIServerAdapter(BasePlatformAdapter):
                     "logprobs": [],
                 })
 
+            async def _emit_reasoning(text: str) -> None:
+                """Stream the model's chain-of-thought as a Responses
+                reasoning item so OpenAI-Responses frontends (e.g. Open WebUI)
+                render a ``<details type="reasoning">`` block.
+
+                The agent fires ``reasoning_callback`` once per
+                ``delta.reasoning_content`` chunk during streaming (see
+                ``_fire_reasoning_delta``).  We open one reasoning output item
+                lazily on the first chunk and append each chunk as a summary
+                part.  The item is recorded in ``emitted_items`` and mutated in
+                place so the terminal ``response.completed`` envelope carries
+                the full reasoning text.
+                """
+                nonlocal reasoning_opened, reasoning_output_index, output_index, reasoning_item
+                if not text:
+                    return
+                if not reasoning_opened:
+                    reasoning_opened = True
+                    reasoning_output_index = output_index
+                    output_index += 1
+                    reasoning_item = {
+                        "id": reasoning_item_id,
+                        "type": "reasoning",
+                        "summary": [],
+                    }
+                    emitted_items.append(reasoning_item)
+                    await _write_event("response.output_item.added", {
+                        "type": "response.output_item.added",
+                        "output_index": reasoning_output_index,
+                        "item": reasoning_item,
+                    })
+                part = {"type": "summary_text", "text": text}
+                if reasoning_item is not None:
+                    reasoning_item["summary"].append(part)
+                await _write_event("response.reasoning_summary_part.added", {
+                    "type": "response.reasoning_summary_part.added",
+                    "item_id": reasoning_item_id,
+                    "output_index": reasoning_output_index,
+                    "part": part,
+                })
+
             async def _emit_tool_started(payload: Dict[str, Any]) -> str:
                 """Emit response.output_item.added for a function_call.
 
@@ -2608,8 +2705,15 @@ class APIServerAdapter(BasePlatformAdapter):
                 nonlocal _batch_timer
                 if isinstance(it, tuple) and len(it) == 2 and isinstance(it[0], str):
                     tag, payload = it
-                    # Flush batched text before tool events
-                    if _batch_buf:
+                    if tag == "__reasoning__":
+                        # Batch reasoning deltas (like text) to avoid Open
+                        # WebUI re-render storms on long chains of thought.
+                        _reasoning_buf.append(payload)
+                        if _batch_timer is None:
+                            _batch_timer = asyncio.create_task(_batch_flush_after(0.05))
+                        return
+                    # Flush batched reasoning + text before tool events
+                    if _reasoning_buf or _batch_buf:
                         await _flush_batch()
                     if tag == "__tool_started__":
                         await _emit_tool_started(payload)
@@ -2624,6 +2728,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
             # ── Batching state ──
             _batch_buf: List[str] = []
+            _reasoning_buf: List[str] = []
             _batch_timer: Optional[asyncio.Task] = None
             _batch_lock = asyncio.Lock()
 
@@ -2640,9 +2745,13 @@ class APIServerAdapter(BasePlatformAdapter):
                 await _flush_batch()
 
             async def _flush_batch() -> None:
-                """Emit a single SSE delta for all accumulated text."""
-                nonlocal _batch_buf
+                """Emit accumulated reasoning then text as coalesced deltas."""
+                nonlocal _batch_buf, _reasoning_buf
                 async with _batch_lock:
+                    if _reasoning_buf:
+                        r_combined = "".join(_reasoning_buf)
+                        _reasoning_buf = []
+                        await _emit_reasoning(r_combined)
                     if _batch_buf:
                         combined = "".join(_batch_buf)
                         _batch_buf = []
@@ -2675,15 +2784,15 @@ class APIServerAdapter(BasePlatformAdapter):
                     if _batch_timer and not _batch_timer.done():
                         _batch_timer.cancel()
                         _batch_timer = None
-                    if _batch_buf:
+                    if _batch_buf or _reasoning_buf:
                         await _flush_batch()
                     break
 
                 await _dispatch(item)
                 last_activity = time.monotonic()
 
-            # Flush any final batched text before processing result
-            if _batch_buf:
+            # Flush any final batched reasoning + text before processing result
+            if _batch_buf or _reasoning_buf:
                 await _flush_batch()
 
             # Pick up agent result + usage from the completed task
@@ -2911,6 +3020,7 @@ class APIServerAdapter(BasePlatformAdapter):
         previous_response_id = body.get("previous_response_id")
         conversation = body.get("conversation")
         store = _coerce_request_bool(body.get("store"), default=True)
+        reasoning_effort_override = self._extract_reasoning_effort(body)
 
         # conversation and previous_response_id are mutually exclusive
         if conversation and previous_response_id:
@@ -3034,6 +3144,11 @@ class APIServerAdapter(BasePlatformAdapter):
                     "result": function_result,
                 }))
 
+            def _on_reasoning(text):
+                """Queue a model reasoning (chain-of-thought) delta for live streaming."""
+                if text:
+                    _stream_q.put(("__reasoning__", text))
+
             agent_ref = [None]
             agent_task = asyncio.ensure_future(self._run_agent(
                 user_message=user_message,
@@ -3044,8 +3159,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_progress_callback=_on_tool_progress,
                 tool_start_callback=_on_tool_start,
                 tool_complete_callback=_on_tool_complete,
+                reasoning_callback=_on_reasoning,
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
+                reasoning_effort=reasoning_effort_override,
             ))
             # Ensure SSE drain loops can terminate without relying on polling
             # agent_task.done(), which can race with queue timeout checks.
@@ -3079,6 +3196,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 ephemeral_system_prompt=instructions,
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
+                reasoning_effort=reasoning_effort_override,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -3707,8 +3825,10 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_progress_callback=None,
         tool_start_callback=None,
         tool_complete_callback=None,
+        reasoning_callback=None,
         agent_ref: Optional[list] = None,
         gateway_session_key: Optional[str] = None,
+        reasoning_effort: Optional[str] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -3739,7 +3859,9 @@ class APIServerAdapter(BasePlatformAdapter):
                     tool_progress_callback=tool_progress_callback,
                     tool_start_callback=tool_start_callback,
                     tool_complete_callback=tool_complete_callback,
+                    reasoning_callback=reasoning_callback,
                     gateway_session_key=gateway_session_key,
+                    reasoning_effort=reasoning_effort,
                 )
                 if agent_ref is not None:
                     agent_ref[0] = agent
