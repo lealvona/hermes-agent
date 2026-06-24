@@ -931,6 +931,32 @@ class SessionDB:
                 self._warn_fts5_unavailable(exc)
             return False
 
+    def _reopen_after_close(self) -> None:
+        """Re-open the SQLite connection if close() nulled it out from under us.
+
+        close() sets self._conn = None. On the hermes-webui 'evict cached
+        agent before steer' path a store could be closed while an in-flight
+        agent still held it, so the next write hit None.execute(...) and the
+        whole session was persisted empty. Lazily reconnect so the transcript
+        is never lost. Caller must hold self._lock. No-op for read-only stores.
+        """
+        if self.read_only or self._conn is not None:
+            return
+        logger.warning(
+            "state.db connection was None on write \u2014 reconnecting (db=%s)",
+            self.db_path,
+        )
+        conn = sqlite3.connect(
+            str(self.db_path),
+            check_same_thread=False,
+            timeout=1.0,
+            isolation_level=None,
+        )
+        conn.row_factory = sqlite3.Row
+        apply_wal_with_fallback(conn, db_label="state.db")
+        conn.execute("PRAGMA foreign_keys=ON")
+        self._conn = conn
+
     def _execute_write(self, fn: Callable[[sqlite3.Connection], T]) -> T:
         """Execute a write transaction with BEGIN IMMEDIATE and jitter retry.
 
@@ -950,6 +976,8 @@ class SessionDB:
         for attempt in range(self._WRITE_MAX_RETRIES):
             try:
                 with self._lock:
+                    if self._conn is None and not self.read_only:
+                        self._reopen_after_close()
                     self._conn.execute("BEGIN IMMEDIATE")
                     try:
                         result = fn(self._conn)
